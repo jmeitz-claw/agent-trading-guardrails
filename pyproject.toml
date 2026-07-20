@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "agent-trading-guardrails"
+version = "0.1.0"
+description = "A read-only pre-trade safety gate, audit ledger, and kill switch for autonomous trading agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+keywords = ["trading", "risk", "guardrails", "llm", "agent", "kalshi", "prediction-markets", "compliance"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Financial and Insurance Industry",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+dependencies = []   # stdlib-only by design — nothing to audit, nothing to break
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[project.scripts]
+guardrails = "guardrails.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/jmeitz-claw/kalshi-trading-scheduled"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["guardrails*"]

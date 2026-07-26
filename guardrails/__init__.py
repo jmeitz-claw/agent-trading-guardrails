@@ -24,7 +24,7 @@ from .engine import Guardrails, Verdict, check_trade, RULE_NAMES
 from .ledger import AuditLedger, LedgerRow
 from .killswitch import KillSwitch
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "GuardrailConfig",

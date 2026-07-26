@@ -21,6 +21,50 @@ from typing import List, Optional
 
 from .config import GuardrailConfig
 
+# Numeric trade fields that must be finite when present. NaN is uniquely
+# dangerous in a gate built from `>` / `>=` comparisons: it compares False
+# against everything, so it does not fail one rule — it silently disables every
+# rule it touches while the verdict stays passed=True. Non-finite values arrive
+# from arithmetic upstream (0/0 in a fill-weighted average, a partial API
+# payload) and from JSON itself, since Python's json module parses the bare
+# `NaN` / `Infinity` literals.
+_NUMERIC_FIELDS = (
+    "market_price", "model_prob", "balance", "edge_pt", "open_position_cost",
+    "bankroll", "market_volume", "peak_balance", "today_pnl_dollars",
+    "starting_balance_dollars",
+)
+
+
+def nonfinite_fields(trade: dict) -> List[str]:
+    """Names of numeric trade fields that are present but NaN/±Inf.
+
+    Absent, None, and non-numeric values are NOT reported — each rule already
+    has a documented fallback for those, and that path is fail-safe because it
+    never leaves a rule comparing against a poisoned float.
+    """
+    bad: List[str] = []
+    for key in _NUMERIC_FIELDS:
+        val = trade.get(key)
+        if val is None:
+            continue
+        try:
+            num = float(val)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(num):
+            bad.append(key)
+    pnl = trade.get("recent_daily_pnl")
+    if isinstance(pnl, (list, tuple)):
+        for i, val in enumerate(pnl):
+            try:
+                num = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(num):
+                bad.append(f"recent_daily_pnl[{i}]")
+    return bad
+
+
 RULE_NAMES = {
     "R-001": "fractional-Kelly position sizing (drawdown-aware)",
     "R-006": "minimum daily volume floor",
@@ -107,6 +151,11 @@ class Guardrails:
     def _consecutive_losing_days(recent_daily_pnl) -> int:
         if not recent_daily_pnl:
             return 0
+        # A non-sequence (a bare int from a malformed caller) counts as no
+        # streak, matching "field absent" — iterating it raised TypeError
+        # straight out of the gate.
+        if not isinstance(recent_daily_pnl, (list, tuple)):
+            return 0
         streak = 0
         for pnl in recent_daily_pnl:
             try:
@@ -158,12 +207,59 @@ class Guardrails:
             return Verdict(False, [f"R-INPUT: balance {balance} must be > 0"],
                            blocking_rules=["R-INPUT"])
 
-        open_cost = float(trade.get("open_position_cost", 0.0) or 0.0)
-        bankroll = float(trade.get("bankroll", balance) or balance)
+        # Every rule below is a `>` / `>=` comparison. NaN compares False against
+        # all of them, so one NaN does not fail a check — it silently switches
+        # that rule OFF while the verdict stays passed=True. Refuse instead.
+        bad_fields = nonfinite_fields(trade)
+        if bad_fields:
+            return Verdict(False,
+                           [f"R-INPUT: non-finite numeric field(s): {', '.join(bad_fields)}"],
+                           blocking_rules=["R-INPUT"])
+
+        # Caller-computed optionals. `float(... or default)` conflated three
+        # cases: absent (use default), non-numeric (raised ValueError out of the
+        # gate), and explicitly-bad sign — a negative open cost *loosens* the
+        # R-008/R-025 capital cap, and `bankroll=0` was swallowed by `or` and
+        # silently re-sized off the full balance.
+        raw_open = trade.get("open_position_cost")
+        if raw_open is None:
+            open_cost = 0.0
+        else:
+            try:
+                open_cost = float(raw_open)
+            except (TypeError, ValueError):
+                open_cost = 0.0
+                advisories.append("R-008 fallback: open_position_cost not numeric — treated as $0")
+        if open_cost < 0.0:
+            return Verdict(False, [f"R-INPUT: open_position_cost {open_cost} must be >= 0"],
+                           blocking_rules=["R-INPUT"])
+
+        raw_bankroll = trade.get("bankroll")
+        if raw_bankroll is None:
+            bankroll = balance
+        else:
+            try:
+                bankroll = float(raw_bankroll)
+            except (TypeError, ValueError):
+                bankroll = balance
+                advisories.append("R-001 fallback: bankroll not numeric — using balance")
+        if bankroll <= 0.0:
+            return Verdict(False, [f"R-INPUT: bankroll {bankroll} must be > 0"],
+                           blocking_rules=["R-INPUT"])
 
         # -- edge ------------------------------------------------------------
-        if trade.get("edge_pt") is not None:
-            edge_pt = float(trade["edge_pt"])
+        explicit_edge = trade.get("edge_pt")
+        if explicit_edge is not None:
+            try:
+                explicit_edge = float(explicit_edge)
+            except (TypeError, ValueError):
+                # Was an uncaught float() raise. Fall back to the derived edge:
+                # the inputs it needs are all validated above, so the trade is
+                # still decidable.
+                advisories.append("R-EDGE fallback: edge_pt not numeric — derived from model_prob")
+                explicit_edge = None
+        if explicit_edge is not None:
+            edge_pt = explicit_edge
         elif side == "YES":
             edge_pt = (model_prob - market_price) * 100.0
         else:  # NO wins with probability (1 - model_prob)

@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from .config import GuardrailConfig
-from .engine import Guardrails, check_trade
+from .engine import Guardrails, check_trade, nonfinite_fields
 from .ledger import AuditLedger
 from .killswitch import KillSwitch
 
@@ -85,6 +85,46 @@ def run() -> int:
     # --- conservative preset is stricter ---
     rc = check_trade(dict(base), GuardrailConfig.conservative())
     check("conservative smaller size", rc.size < g.check(dict(base)).size)
+
+    # --- non-finite inputs fail closed ---
+    # NaN compares False against every `>`/`>=` in the gate, so before this
+    # guard each of these returned passed=True with the rules it touched
+    # silently disabled (NaN balance -> R-008/R-025/R-040 off; NaN edge_pt ->
+    # R-EDGE/R-017 off; NaN open_position_cost -> capital guardrail off).
+    nan, inf = float("nan"), float("inf")
+    for fname in ("balance", "edge_pt", "open_position_cost", "bankroll",
+                  "peak_balance", "today_pnl_dollars", "starting_balance_dollars",
+                  "market_volume"):
+        for bad in (nan, inf):
+            v = g.check(dict(base, **{fname: bad}))
+            check(f"non-finite {fname} blocked", not v.passed and "R-INPUT" in v.blocking_rules)
+            check(f"non-finite {fname} named", fname in " ".join(v.reasons))
+    check("non-finite pnl entry blocked",
+          not g.check(dict(base, recent_daily_pnl=[-1.0, nan])).passed)
+    check("nonfinite_fields clean", nonfinite_fields(dict(base)) == [])
+
+    # --- bad-sign optionals fail closed ---
+    # Negative open cost loosens the R-008 cap; bankroll=0 was swallowed by a
+    # falsy `or balance` and silently re-sized off the full balance.
+    check("negative open cost blocked", not g.check(dict(base, open_position_cost=-1000.0)).passed)
+    check("zero bankroll blocked", not g.check(dict(base, bankroll=0.0)).passed)
+    check("negative bankroll blocked", not g.check(dict(base, bankroll=-5.0)).passed)
+    check("bankroll omitted still passes", g.check(dict(base)).passed)
+
+    # --- the gate decides, it never raises ---
+    for label, bad_trade in [
+        ("open_position_cost", dict(base, open_position_cost="x")),
+        ("bankroll", dict(base, bankroll="x")),
+        ("edge_pt", dict(base, edge_pt="x")),
+        ("edge_pt list", dict(base, edge_pt=[])),
+        ("recent_daily_pnl int", dict(base, recent_daily_pnl=5)),
+    ]:
+        try:
+            check(f"no-raise {label}", g.check(bad_trade) is not None)
+        except Exception as exc:  # noqa: BLE001 — must decide, never raise
+            failures.append(f"no-raise {label} (raised {type(exc).__name__}: {exc})")
+    rf = g.check(dict(base, edge_pt="x"))
+    check("edge_pt fallback derives", rf.passed and abs(rf.edge_pt - 20.0) < 1e-9)
 
     # --- ledger round-trip ---
     with tempfile.TemporaryDirectory() as d:

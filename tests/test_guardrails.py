@@ -79,6 +79,57 @@ class TestLedger(unittest.TestCase):
             self.assertEqual(len(led.rows_for_symbol("KXFED")), 2)
 
 
+class TestMalformedInput(unittest.TestCase):
+    """Garbage in must mean refuse-to-trade, not "decide with the rules off"."""
+
+    def setUp(self):
+        self.g = Guardrails(GuardrailConfig.default())
+
+    def test_nonfinite_fields_fail_closed(self):
+        # NaN compares False against every `>`/`>=` in the gate, so it does not
+        # fail a rule — it silently disables it. Each of these used to return
+        # passed=True with the touched guardrail switched off.
+        for field in ("balance", "edge_pt", "open_position_cost", "bankroll",
+                      "peak_balance", "today_pnl_dollars", "starting_balance_dollars",
+                      "market_volume"):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                with self.subTest(field=field, value=bad):
+                    v = self.g.check(dict(BASE, **{field: bad}))
+                    self.assertFalse(v.passed)
+                    self.assertIn("R-INPUT", v.blocking_rules)
+                    self.assertIn(field, " ".join(v.reasons))
+
+    def test_nonfinite_pnl_entry_fails_closed(self):
+        v = self.g.check(dict(BASE, recent_daily_pnl=[-1.0, float("nan"), -1.0]))
+        self.assertFalse(v.passed)
+        self.assertIn("recent_daily_pnl[1]", " ".join(v.reasons))
+
+    def test_bad_sign_optionals_fail_closed(self):
+        # A negative open cost subtracts from projected exposure and loosens the
+        # R-008/R-025 cap; bankroll=0 was swallowed by a falsy `or balance` and
+        # silently re-sized off the full balance.
+        self.assertFalse(self.g.check(dict(BASE, open_position_cost=-1000.0)).passed)
+        self.assertFalse(self.g.check(dict(BASE, bankroll=0.0)).passed)
+        self.assertFalse(self.g.check(dict(BASE, bankroll=-5.0)).passed)
+        # omitting them is still the documented default, and still passes
+        self.assertTrue(self.g.check(dict(BASE)).passed)
+
+    def test_gate_decides_never_raises(self):
+        # These escaped as uncaught ValueError/TypeError, leaving fail-safety to
+        # whatever the caller happened to wrap check() in.
+        for bad in (dict(BASE, open_position_cost="x"), dict(BASE, bankroll="x"),
+                    dict(BASE, edge_pt="x"), dict(BASE, edge_pt=[]),
+                    dict(BASE, recent_daily_pnl=5), dict(BASE, recent_daily_pnl="x"),
+                    dict(BASE, market_volume="x"), dict(BASE, peak_balance="x")):
+            with self.subTest(trade=bad):
+                self.assertIsNotNone(self.g.check(bad))
+
+    def test_nonnumeric_edge_falls_back_to_derived(self):
+        v = self.g.check(dict(BASE, edge_pt="x"))
+        self.assertTrue(v.passed)
+        self.assertAlmostEqual(v.edge_pt, 20.0, places=6)
+
+
 class TestKillSwitch(unittest.TestCase):
     def test_engage_release(self):
         with tempfile.TemporaryDirectory() as d:

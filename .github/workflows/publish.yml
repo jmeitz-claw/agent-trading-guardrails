@@ -5,8 +5,7 @@ on:
     types: [published]
   workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [main]
 
 permissions:
   contents: read
